@@ -41,12 +41,14 @@ import org.multipaz.storage.Storage
 import org.multipaz.storage.ephemeral.EphemeralStorage
 import org.multipaz.util.Logger
 import org.multipaz.util.fromHex
+import org.multipaz.util.zlibInflate
 import kotlin.experimental.xor
 import kotlin.random.Random
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.days
 import kotlin.time.Duration.Companion.seconds
@@ -331,6 +333,42 @@ class DeviceResponseTest {
             """.trimIndent(),
             Cbor.toDiagnostics(deviceResponse2.toDataItem(), setOf(DiagnosticOption.PRETTY_PRINT))
         )
+    }
+
+    @Test
+    fun sdJwtDocumentRoundTripUsesZlibCompression() = runTest {
+        val compactSerialization = "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature~disc~kb"
+        val sessionTranscript = buildCborArray { add(Simple.NULL); add(Simple.NULL); add(byteArrayOf(1, 2, 3)) }
+        val deviceResponse = buildDeviceResponse(
+            sessionTranscript = sessionTranscript,
+            status = DeviceResponse.STATUS_OK,
+        ) {
+            addSdJwtDocument(compactSerialization)
+        }
+
+        assertEquals("1.1", deviceResponse.version)
+        assertEquals(1, deviceResponse.sdJwtDocuments.size)
+        assertNotEquals(compactSerialization.encodeToByteArray().toList(), deviceResponse.sdJwtDocuments[0].toList())
+        assertEquals(compactSerialization, deviceResponse.sdJwtDocuments[0].zlibInflate().decodeToString())
+
+        val parsed = DeviceResponse.fromDataItem(deviceResponse.toDataItem())
+        assertEquals(1, parsed.sdJwtDocuments.size)
+        assertEquals(compactSerialization, parsed.sdJwtDocuments[0].zlibInflate().decodeToString())
+    }
+
+    @Test
+    fun deviceResponseWithSdJwtHasSdjwtDocumentsField() = runTest {
+        val compactSerialization = "a.b.c~d~e"
+        val sessionTranscript = buildCborArray { add(Simple.NULL); add(Simple.NULL); add(byteArrayOf(9, 8, 7)) }
+        val deviceResponse = buildDeviceResponse(
+            sessionTranscript = sessionTranscript,
+            status = DeviceResponse.STATUS_OK,
+        ) {
+            addSdJwtDocument(compactSerialization)
+        }
+
+        val cborDiag = Cbor.toDiagnostics(deviceResponse.toDataItem(), setOf(DiagnosticOption.PRETTY_PRINT))
+        assertTrue(cborDiag.contains("\"sdjwtDocuments\""))
     }
 
     @Test

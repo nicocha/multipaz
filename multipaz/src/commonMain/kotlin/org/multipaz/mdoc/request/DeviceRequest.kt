@@ -6,6 +6,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.addJsonArray
 import kotlinx.serialization.json.addJsonObject
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
@@ -48,8 +49,10 @@ import org.multipaz.presentment.CredentialPresentmentSetOption
 import org.multipaz.presentment.CredentialPresentmentSetOptionMember
 import org.multipaz.presentment.CredentialPresentmentSetOptionMemberMatch
 import org.multipaz.presentment.PresentmentSource
+import org.multipaz.request.JsonRequestedClaim
 import org.multipaz.request.MdocRequestedClaim
 import org.multipaz.request.RequestedClaim
+import org.multipaz.sdjwt.credential.KeyBoundSdJwtVcCredential
 import org.multipaz.util.Logger
 import kotlin.collections.component1
 import kotlin.collections.component2
@@ -462,8 +465,21 @@ data class DeviceRequest private constructor(
 
     private data class DocRequestResult(
         val docRequest: DocRequest,
-        val matches: List<DocRequestMatch>
+        val matches: List<DocRequestMatch>,
+        val sdJwtFailureReason: SdJwtFailureReason? = null
     )
+
+    private enum class SdJwtFailureReason {
+        NO_SD_JWT_CANDIDATE_FOUND,
+        VCT_MISMATCH,
+        REQUESTED_CLAIM_PATH_NOT_PRESENT
+    }
+
+    private sealed class SdJwtClaimMatchResult {
+        data class Match(val value: Triple<Credential, Map<RequestedClaim, Claim>, DocRequest>) :
+            SdJwtClaimMatchResult()
+        data class Failure(val reason: SdJwtFailureReason) : SdJwtClaimMatchResult()
+    }
 
     /**
      * Executes the ISO 18013-5 request against a [PresentmentSource].
@@ -503,13 +519,14 @@ data class DeviceRequest private constructor(
             // As per 18013-5:2021 we only look at the first DocRequest.
             val result = docRequestResults[0]
             if (result.matches.isEmpty()) {
+                logSdJwtFailureAtThrowPoint(result)
                 throw Iso18015ResponseException("No matching credentials for first DocRequest")
             }
 
             // Create a single set, with a single option, containing matches for the first DocRequest.
             val memberMatches = result.matches.map { match ->
                 CredentialPresentmentSetOptionMemberMatch(
-                    credential = match.credential as MdocCredential,
+                    credential = match.credential,
                     claims = match.claims,
                     source = CredentialMatchSourceIso18013(docRequest = match.docRequest)
                 )
@@ -542,7 +559,7 @@ data class DeviceRequest private constructor(
                         val members = docRequestIds.map { id ->
                             val matches = docRequestResults[id].matches.map { match ->
                                 CredentialPresentmentSetOptionMemberMatch(
-                                    credential = match.credential as MdocCredential,
+                                    credential = match.credential,
                                     claims = match.claims,
                                     source = CredentialMatchSourceIso18013(docRequest = match.docRequest)
                                 )
@@ -555,6 +572,15 @@ data class DeviceRequest private constructor(
                 }
 
                 if (!satisfied && useCase.mandatory) {
+                    useCase.documentSets
+                        .flatMap { it.docRequestIds }
+                        .distinct()
+                        .filter { id ->
+                            id >= 0 && id < docRequestResults.size && docRequestResults[id].matches.isEmpty()
+                        }
+                        .forEach { id ->
+                            logSdJwtFailureAtThrowPoint(docRequestResults[id])
+                        }
                     throw Iso18015ResponseException("No credentials match required UseCase")
                 }
 
@@ -577,12 +603,32 @@ data class DeviceRequest private constructor(
         presentmentSource: PresentmentSource,
         keyAgreementPossible: List<EcCurve>
     ): DocRequestResult {
+        val isSdJwtRequest =
+            docRequest.docRequestInfo?.docFormat == DocRequestInfo.DOC_FORMAT_SD_JWT_KB
+        val requestedVct = docRequest.docRequestInfo?.sdJwtRequest?.vct
+
         // Find credentials matching the requested DocType
         val candidates = mutableListOf<Credential>()
+        var hasAnySdJwtCredential = false
+        var hasSdJwtCredentialWithRequestedVct = false
         for (documentId in presentmentSource.documentStore.listDocumentIds()) {
             val document = presentmentSource.documentStore.lookupDocument(documentId) ?: continue
-            val credential = document.getCertifiedCredentials().find {
-                it is MdocCredential && it.docType == docRequest.docType
+            val certifiedCredentials = document.getCertifiedCredentials()
+            if (isSdJwtRequest) {
+                val sdJwtCredentials = certifiedCredentials.filterIsInstance<KeyBoundSdJwtVcCredential>()
+                if (sdJwtCredentials.isNotEmpty()) {
+                    hasAnySdJwtCredential = true
+                    if (requestedVct == null || sdJwtCredentials.any { it.vct == requestedVct }) {
+                        hasSdJwtCredentialWithRequestedVct = true
+                    }
+                }
+            }
+            val credential = certifiedCredentials.find {
+                if (isSdJwtRequest) {
+                    it is KeyBoundSdJwtVcCredential && (requestedVct == null || it.vct == requestedVct)
+                } else {
+                    it is MdocCredential && it.docType == docRequest.docType
+                }
             }
             if (credential != null) {
                 candidates.add(credential)
@@ -590,18 +636,61 @@ data class DeviceRequest private constructor(
         }
 
         val matches = mutableListOf<DocRequestMatch>()
+        var sawMissingClaimPath = false
         // Sort by displayName to ensure deterministic order
         for (cred in candidates.sortedBy { it.document.displayName }) {
+            if (isSdJwtRequest) {
+                when (
+                    val matchResult = findBestMatchingSdJwtClaims(
+                        cred = cred,
+                        docRequest = docRequest,
+                        presentmentSource = presentmentSource,
+                        keyAgreementPossible = keyAgreementPossible
+                    )
+                ) {
+                    is SdJwtClaimMatchResult.Match -> {
+                        val bestMatch = matchResult.value
+                        matches.add(
+                            DocRequestMatch(
+                                credential = bestMatch.first,
+                                claims = bestMatch.second,
+                                docRequest = bestMatch.third
+                            )
+                        )
+                    }
+
+                    is SdJwtClaimMatchResult.Failure -> {
+                        if (matchResult.reason == SdJwtFailureReason.REQUESTED_CLAIM_PATH_NOT_PRESENT) {
+                            sawMissingClaimPath = true
+                        }
+                    }
+                }
+                continue
+            }
+
             val bestMatch = findBestMatchingClaims(cred, docRequest, presentmentSource, keyAgreementPossible)
             if (bestMatch != null) {
-                matches.add(DocRequestMatch(
-                    credential = bestMatch.first,
-                    claims = bestMatch.second,
-                    docRequest = bestMatch.third
-                ))
+                matches.add(
+                    DocRequestMatch(
+                        credential = bestMatch.first,
+                        claims = bestMatch.second,
+                        docRequest = bestMatch.third
+                    )
+                )
             }
         }
-        return DocRequestResult(docRequest, matches)
+
+        val sdJwtFailureReason = if (isSdJwtRequest && matches.isEmpty()) {
+            when {
+                !hasAnySdJwtCredential -> SdJwtFailureReason.NO_SD_JWT_CANDIDATE_FOUND
+                requestedVct != null && !hasSdJwtCredentialWithRequestedVct -> SdJwtFailureReason.VCT_MISMATCH
+                sawMissingClaimPath -> SdJwtFailureReason.REQUESTED_CLAIM_PATH_NOT_PRESENT
+                else -> null
+            }
+        } else {
+            null
+        }
+        return DocRequestResult(docRequest, matches, sdJwtFailureReason)
     }
 
     /**
@@ -717,6 +806,82 @@ data class DeviceRequest private constructor(
         }
 
         return null
+    }
+
+    private suspend fun findBestMatchingSdJwtClaims(
+        cred: Credential,
+        docRequest: DocRequest,
+        presentmentSource: PresentmentSource,
+        keyAgreementPossible: List<EcCurve>
+    ): SdJwtClaimMatchResult {
+        val sdJwtCredential = cred as? KeyBoundSdJwtVcCredential
+            ?: return SdJwtClaimMatchResult.Failure(SdJwtFailureReason.NO_SD_JWT_CANDIDATE_FOUND)
+        val requestInfo = docRequest.docRequestInfo
+        val requestedVct = requestInfo?.sdJwtRequest?.vct
+        if (requestedVct != null && sdJwtCredential.vct != requestedVct) {
+            return SdJwtClaimMatchResult.Failure(SdJwtFailureReason.VCT_MISMATCH)
+        }
+
+        val requestedClaims = requestInfo?.sdJwtRequest?.claims?.map {
+            JsonRequestedClaim(
+                id = null,
+                vctValues = listOf(sdJwtCredential.vct),
+                claimPath = buildJsonArray {
+                    it.path.forEach { element ->
+                        add(element)
+                    }
+                },
+                values = null
+            )
+        } ?: docRequest.nameSpaces.flatMap { (_, dataElements) ->
+            dataElements.keys.map { elementName ->
+                JsonRequestedClaim(
+                    id = null,
+                    vctValues = listOf(sdJwtCredential.vct),
+                    claimPath = buildJsonArray { add(elementName) },
+                    values = null
+                )
+            }
+        }
+
+        val selectedCred = if (requestedClaims.isNotEmpty()) {
+            presentmentSource.selectCredential(
+                document = cred.document,
+                requestedClaims = requestedClaims,
+                keyAgreementPossible = keyAgreementPossible
+            )
+        } else {
+            sdJwtCredential
+        }
+        if (selectedCred !is KeyBoundSdJwtVcCredential) {
+            return SdJwtClaimMatchResult.Failure(SdJwtFailureReason.NO_SD_JWT_CANDIDATE_FOUND)
+        }
+
+        val claimsInCredential = selectedCred.getClaims(
+            documentTypeRepository = presentmentSource.documentTypeRepository
+        )
+        val matchingClaimValues = mutableMapOf<RequestedClaim, Claim>()
+        for (requestedClaim in requestedClaims) {
+            val foundClaim = claimsInCredential.findMatchingClaim(requestedClaim)
+            if (foundClaim == null) {
+                return SdJwtClaimMatchResult.Failure(SdJwtFailureReason.REQUESTED_CLAIM_PATH_NOT_PRESENT)
+            }
+            matchingClaimValues[requestedClaim] = foundClaim
+        }
+        return SdJwtClaimMatchResult.Match(Triple(selectedCred, matchingClaimValues, docRequest))
+    }
+
+    private fun logSdJwtFailureAtThrowPoint(result: DocRequestResult) {
+        if (result.docRequest.docRequestInfo?.docFormat != DocRequestInfo.DOC_FORMAT_SD_JWT_KB) {
+            return
+        }
+        val reason = when (result.sdJwtFailureReason) {
+            SdJwtFailureReason.NO_SD_JWT_CANDIDATE_FOUND -> "no SD-JWT candidate found"
+            SdJwtFailureReason.VCT_MISMATCH -> "vct mismatch"
+            SdJwtFailureReason.REQUESTED_CLAIM_PATH_NOT_PRESENT -> "requested claim path not present"
+            null -> "unknown"
+        }
+        Logger.d(TAG, "SD-JWT request unsatisfied at throw point: $reason")
     }
 
     fun getRequester(): X509CertChain? {

@@ -16,8 +16,17 @@ import org.multipaz.mdoc.request.EncryptionParameters
 import org.multipaz.mdoc.response.DeviceResponse.Companion.STATUS_OK
 import org.multipaz.mdoc.zkp.ZkDocument
 import org.multipaz.request.MdocRequestedClaim
+import org.multipaz.util.zlibDeflate
 import kotlin.time.Clock
 import kotlin.time.Instant
+
+/** Compressor function for SD-JWT document payload bytes. */
+typealias SdJwtDocumentCompressor = suspend (ByteArray) -> ByteArray
+
+/**
+ * Default SD-JWT compressor: DEFLATE (RFC 1951) with ZLIB wrapper (RFC 1950).
+ */
+val SdJwtZlibCompressor: SdJwtDocumentCompressor = { bytes -> bytes.zlibDeflate() }
 
 /**
  * Top-level device response in ISO 18013-5.
@@ -32,6 +41,8 @@ import kotlin.time.Instant
  * @property status the status field containing for example [STATUS_OK] or [STATUS_GENERAL_ERROR].
  * @property documents a list of returned documents.
  * @property zkDocuments a list of returned documents with ZKP.
+ * @property sdJwtDocuments a list of returned SD-JWT+KB compact serializations compressed with
+ *   DEFLATE (RFC 1951) in ZLIB format (RFC 1950).
  * @property encryptedDocuments a list of returned encrypted documents.
  * @property documentErrors a list of returned errors.
  */
@@ -41,6 +52,7 @@ data class DeviceResponse internal constructor(
     val status: Int,
     private val documents_: List<MdocDocument>,
     val zkDocuments: List<ZkDocument>,
+    val sdJwtDocuments: List<ByteArray>,
     val encryptedDocuments: List<EncryptedDocuments>,
     val documentErrors: List<Map<String, Int>>
 ) {
@@ -109,6 +121,11 @@ data class DeviceResponse internal constructor(
         if (zkDocuments.isNotEmpty()) {
             putCborArray("zkDocuments") {
                 zkDocuments.forEach { add(it.toDataItem()) }
+            }
+        }
+        if (sdJwtDocuments.isNotEmpty()) {
+            putCborArray("sdjwtDocuments") {
+                sdJwtDocuments.forEach { add(it) }
             }
         }
         if (encryptedDocuments.isNotEmpty()) {
@@ -201,6 +218,9 @@ data class DeviceResponse internal constructor(
             val zkDocuments = dataItem.getOrNull("zkDocuments")?.asArray?.map {
                 ZkDocument.fromDataItem(it)
             }
+            val sdJwtDocuments = dataItem.getOrNull("sdjwtDocuments")?.asArray?.map {
+                it.asBstr
+            }
             val encryptedDocuments = dataItem.getOrNull("encryptedDocuments")?.asArray?.map {
                 EncryptedDocuments.fromDataItem(it)
             }
@@ -214,6 +234,7 @@ data class DeviceResponse internal constructor(
                 status = status,
                 documents_ = documents ?: emptyList(),
                 zkDocuments = zkDocuments ?: emptyList(),
+                sdJwtDocuments = sdJwtDocuments ?: emptyList(),
                 encryptedDocuments = encryptedDocuments ?: emptyList(),
                 documentErrors = documentErrors ?: emptyList()
             )
@@ -236,6 +257,7 @@ data class DeviceResponse internal constructor(
     ) {
         internal val documents = mutableListOf<MdocDocument>()
         internal val zkDocuments = mutableListOf<ZkDocument>()
+        internal val sdJwtDocuments = mutableListOf<ByteArray>()
         internal val encryptedDocuments = mutableListOf<EncryptedDocuments>()
         internal val documentErrors = mutableListOf<Map<String, Int>>()
 
@@ -316,6 +338,29 @@ data class DeviceResponse internal constructor(
         }
 
         /**
+         * Low-level function to add an SD-JWT document payload.
+         *
+         * The payload is expected to already be compressed using DEFLATE with ZLIB format.
+         */
+        fun addSdJwtDocument(sdJwtDocument: ByteArray) = apply {
+            sdJwtDocuments.add(sdJwtDocument)
+        }
+
+        /**
+         * Adds an SD-JWT+KB compact serialization compressed for `sdjwtDocuments`.
+         *
+         * Compression defaults to DEFLATE (RFC 1951) with ZLIB wrapper (RFC 1950).
+         */
+        suspend fun addSdJwtDocument(
+            compactSerialization: String,
+            compressor: SdJwtDocumentCompressor = SdJwtZlibCompressor
+        ) = apply {
+            val compressed = compressor(compactSerialization.encodeToByteArray())
+            check(compressed.isNotEmpty()) { "Compressed SD-JWT document must not be empty" }
+            sdJwtDocuments.add(compressed)
+        }
+
+        /**
          * Adds encrypted documents to the response.
          *
          * @param encryptedDocuments an [EncryptedDocuments] structure.
@@ -364,7 +409,11 @@ data class DeviceResponse internal constructor(
          * @return a [DeviceResponse] object.
          */
         fun build(): DeviceResponse {
-            val versionToUse = version ?: if (zkDocuments.isNotEmpty() || encryptedDocuments.isNotEmpty()) {
+            val versionToUse = version ?: if (
+                zkDocuments.isNotEmpty() ||
+                sdJwtDocuments.isNotEmpty() ||
+                encryptedDocuments.isNotEmpty()
+            ) {
                 "1.1"
             } else {
                 "1.0"
@@ -375,6 +424,7 @@ data class DeviceResponse internal constructor(
                 status = status,
                 documents_ = documents,
                 zkDocuments = zkDocuments,
+                sdJwtDocuments = sdJwtDocuments,
                 encryptedDocuments = encryptedDocuments,
                 documentErrors = documentErrors,
             )

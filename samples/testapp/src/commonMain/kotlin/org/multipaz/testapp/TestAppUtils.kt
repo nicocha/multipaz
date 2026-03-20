@@ -139,9 +139,9 @@ object TestAppUtils {
             is MultiDocumentCannedRequest -> {
                 buildDeviceRequestFromDcql(
                     sessionTranscript = RawCbor(encodedSessionTranscript),
-                    dcql = Json.decodeFromString<JsonObject>( request.dcqlString)
+                    dcql = Json.decodeFromString<JsonObject>(request.dcqlString),
                 ) {
-                    addReaderAuthAll(readerKey)
+                    addReaderAuthAll(readerKey = readerKey)
                 }
             }
         }

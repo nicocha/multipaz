@@ -7,6 +7,7 @@ import org.multipaz.document.Document
 import org.multipaz.eventlogger.EventPresentmentData
 import org.multipaz.mdoc.credential.MdocCredential
 import org.multipaz.mdoc.devicesigned.buildDeviceNamespaces
+import org.multipaz.mdoc.request.DocRequestInfo
 import org.multipaz.mdoc.request.DeviceRequest
 import org.multipaz.mdoc.response.DeviceResponse
 import org.multipaz.mdoc.response.Iso18015ResponseException
@@ -15,8 +16,11 @@ import org.multipaz.mdoc.response.buildDeviceResponse
 import org.multipaz.mdoc.transport.MdocTransportClosedException
 import org.multipaz.mdoc.zkp.ZkSystem
 import org.multipaz.mdoc.zkp.ZkSystemSpec
+import org.multipaz.presentment.model.buildSdJwtKbPresentation
+import org.multipaz.presentment.model.computeSessionTranscriptHash
 import org.multipaz.request.MdocRequestedClaim
 import org.multipaz.request.Requester
+import org.multipaz.sdjwt.credential.KeyBoundSdJwtVcCredential
 import org.multipaz.util.Logger
 import kotlin.coroutines.cancellation.CancellationException
 
@@ -100,13 +104,38 @@ suspend fun mdocPresentment(
         }
 
         for (match in selection.matches) {
-            match.source as CredentialMatchSourceIso18013
-            val zkRequested = match.source.docRequest.docRequestInfo?.zkRequest != null
+            val sourceMatch = match.source as CredentialMatchSourceIso18013
+            val docRequest = sourceMatch.docRequest
+            val docFormat = docRequest.docRequestInfo?.docFormat ?: DocRequestInfo.DOC_FORMAT_MDOC
+
+            if (docFormat == DocRequestInfo.DOC_FORMAT_SD_JWT_KB) {
+                val requestedVct = docRequest.docRequestInfo?.sdJwtRequest?.vct
+                val sdJwtCredential = (match.credential as? KeyBoundSdJwtVcCredential)
+                    ?: (match.credential.document.getCertifiedCredentials().find {
+                        it is KeyBoundSdJwtVcCredential &&
+                            (requestedVct == null || it.vct == requestedVct)
+                    } as? KeyBoundSdJwtVcCredential)
+                    ?: throw PresentmentCannotSatisfyRequestException(
+                        "Request docFormat is sd-jwt+kb but selected credential is not SD-JWT",
+                        IllegalStateException("Selected credential is not KeyBoundSdJwtVcCredential")
+                    )
+                val compactSerialization = buildSdJwtKbPresentation(
+                    docRequest = docRequest,
+                    credential = sdJwtCredential,
+                    sessionTranscript = sessionTranscript,
+                    nonce = computeSessionTranscriptHash(sessionTranscript),
+                )
+                addSdJwtDocument(compactSerialization)
+                match.credential.increaseUsageCount()
+                continue
+            }
+
+            val zkRequested = docRequest.docRequestInfo?.zkRequest != null
 
             var zkSystemMatch: ZkSystem? = null
             var zkSystemSpec: ZkSystemSpec? = null
             if (zkRequested) {
-                val requesterSupportedZkSpecs = match.source.docRequest.docRequestInfo.zkRequest.systemSpecs
+                val requesterSupportedZkSpecs = docRequest.docRequestInfo.zkRequest.systemSpecs
                 val zkSystemRepository = source.zkSystemRepository
                 if (zkSystemRepository != null) {
                     // Find the first ZK System that the requester supports and matches the document

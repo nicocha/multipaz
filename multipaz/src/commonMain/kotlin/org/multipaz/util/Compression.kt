@@ -68,7 +68,7 @@ private val zlibWrapperHeader = byteArrayOf(120, -38)
  * @throws IllegalArgumentException if [compressionLevel] isn't valid.
  */
 suspend fun ByteArray.zlibDeflate(compressionLevel: Int = 9): ByteArray =
-    zlibWrapperHeader + deflate() + adler32()
+    zlibWrapperHeader + deflate(compressionLevel) + adler32()
 
 
 /**

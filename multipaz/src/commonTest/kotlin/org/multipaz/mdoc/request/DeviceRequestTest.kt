@@ -8,8 +8,13 @@ import kotlinx.io.bytestring.ByteString
 import org.multipaz.asn1.ASN1Integer
 import org.multipaz.cbor.Cbor
 import org.multipaz.cbor.DiagnosticOption
+import org.multipaz.cbor.Bstr
 import org.multipaz.cbor.Tstr
+import org.multipaz.cbor.Tagged
 import org.multipaz.cbor.buildCborArray
+import org.multipaz.cbor.buildCborMap
+import org.multipaz.cbor.putCborArray
+import org.multipaz.cbor.putCborMap
 import org.multipaz.cose.Cose
 import org.multipaz.cose.toCoseLabel
 import org.multipaz.crypto.Algorithm
@@ -37,6 +42,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class DeviceRequestTest {
     // Test against the test vector in Annex D of 18013-5:2021
@@ -473,6 +479,98 @@ class DeviceRequestTest {
             )
         )
         assertEquals(DeviceRequest.fromDataItem(deviceRequest.toDataItem()), deviceRequest)
+    }
+
+    @Test
+    fun docRequestInfoSdJwtRequestRoundTrip() = runTest {
+        val sessionTranscript = buildCborArray { add("Doesn't matter") }
+        val deviceRequest = buildDeviceRequest(
+            sessionTranscript = sessionTranscript
+        ) {
+            addDocRequest(
+                docType = "sdjwt",
+                nameSpaces = emptyMap(),
+                docRequestInfo = DocRequestInfo(
+                    docFormat = DocRequestInfo.DOC_FORMAT_SD_JWT_KB,
+                    sdJwtRequest = SdJwtRequest(
+                        vct = "urn:eu.europa.ec.eudi:pid:1",
+                        claims = listOf(
+                            SdJwtClaimRequest(
+                                path = listOf("given_name"),
+                                intentToRetain = false
+                            ),
+                            SdJwtClaimRequest(
+                                path = listOf("address", "formatted"),
+                                intentToRetain = true
+                            )
+                        )
+                    ),
+                    alternativeSdJwtClaimsSet = listOf(
+                        AlternativeSdJwtClaimsSet(
+                            requestedClaim = listOf("address", "formatted"),
+                            alternativeClaimSets = listOf(
+                                listOf("address", "street_address"),
+                                listOf("address", "locality")
+                            )
+                        )
+                    )
+                )
+            )
+        }
+
+        val parsed = DeviceRequest.fromDataItem(deviceRequest.toDataItem())
+        val info = parsed.docRequests.first().docRequestInfo
+        assertNotNull(info)
+        assertEquals(DocRequestInfo.DOC_FORMAT_SD_JWT_KB, info.docFormat)
+        val sdJwtRequest = info.sdJwtRequest
+        assertNotNull(sdJwtRequest)
+        assertEquals("urn:eu.europa.ec.eudi:pid:1", sdJwtRequest.vct)
+        assertEquals(listOf("given_name"), sdJwtRequest.claims[0].path)
+        assertEquals(listOf("address", "formatted"), sdJwtRequest.claims[1].path)
+        assertEquals(true, sdJwtRequest.claims[1].intentToRetain)
+        assertEquals(listOf("address", "formatted"), info.alternativeSdJwtClaimsSet[0].requestedClaim)
+        assertEquals(listOf("address", "street_address"), info.alternativeSdJwtClaimsSet[0].alternativeClaimSets[0])
+    }
+
+    @Test
+    fun docRequestInfoWithoutDocFormatIgnoresSdJwtRequest() {
+        val itemsRequest = buildCborMap {
+            put("docType", DrivingLicense.MDL_DOCTYPE)
+            putCborMap("nameSpaces") {
+                putCborMap(DrivingLicense.MDL_NAMESPACE) {
+                    put("given_name", false)
+                }
+            }
+            put("requestInfo", buildCborMap {
+                put("sdjwtRequest", buildCborMap {
+                    put("vct", "urn:eu.europa.ec.eudi:pid:1")
+                    putCborArray("claims") {
+                        add(buildCborMap {
+                            putCborArray("path") {
+                                add("given_name")
+                            }
+                            put("intentToRetain", false)
+                        })
+                    }
+                })
+            })
+        }
+        val deviceRequest = DeviceRequest.fromDataItem(
+            buildCborMap {
+                put("version", "1.1")
+                putCborArray("docRequests") {
+                    add(buildCborMap {
+                        put("itemsRequest", Tagged(Tagged.ENCODED_CBOR, Bstr(Cbor.encode(itemsRequest))))
+                    })
+                }
+            }
+        )
+
+        val info = deviceRequest.docRequests.first().docRequestInfo
+        assertNotNull(info)
+        assertEquals(DocRequestInfo.DOC_FORMAT_MDOC, info.docFormat)
+        assertNull(info.sdJwtRequest)
+        assertTrue(info.alternativeSdJwtClaimsSet.isEmpty())
     }
 
     @Test
